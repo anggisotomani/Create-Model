@@ -1,0 +1,192 @@
+# Install necessary packages
+!pip install wurlitzer
+!pip install tensorflow
+
+# Import necessary libraries
+import tensorflow as tf
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Verify TensorFlow and GPU availability
+if tf.config.list_physical_devices('GPU'):
+    print(f'Default GPU Device: {tf.config.list_physical_devices("GPU")[0]}')
+else:
+    print("Please install the GPU version of TensorFlow")
+
+# TensorFlow version
+print(f'TensorFlow version: {tf.__version__}')
+
+# Define constants
+GLOBAL_BATCH_SIZE = 32
+INPUT_SHAPE = (128, 128)
+
+# Enable mixed precision training
+tf.keras.mixed_precision.set_global_policy('mixed_float16')
+
+# Create a MirroredStrategy for multi-GPU training (optional)
+strategy = tf.distribute.MirroredStrategy()
+print(f"Number of devices: {strategy.num_replicas_in_sync}")
+
+# Function to create training and validation data generators
+def train_val_generators(data_dir, validation_split=0.2):
+    train_datagen = ImageDataGenerator(
+        rescale=1./255,
+        zoom_range=0.2,
+        rotation_range=15,
+        brightness_range=[0.8, 1.2],
+        validation_split=validation_split
+    )
+    
+    validation_datagen = ImageDataGenerator(
+        rescale=1./255,
+        validation_split=validation_split
+    )
+
+    train_generator = train_datagen.flow_from_directory(
+        directory=data_dir,
+        batch_size=GLOBAL_BATCH_SIZE,
+        target_size=INPUT_SHAPE,
+        class_mode='categorical',
+        subset='training'
+    )
+
+    validation_generator = validation_datagen.flow_from_directory(
+        directory=data_dir,
+        batch_size=GLOBAL_BATCH_SIZE,
+        target_size=INPUT_SHAPE,
+        class_mode='categorical',
+        subset='validation'
+    )
+    
+    return train_generator, validation_generator
+
+# Create data generators
+data_dir = "/kaggle/input/basic-ingredients/Dataset"
+train_generator, validation_generator = train_val_generators(data_dir)
+print(f'Number of classes: {len(train_generator.class_indices)}')
+
+# Function to create a pre-trained MobileNetV1 model
+def create_pre_trained_model():
+    base_model = tf.keras.applications.MobileNet(
+        input_shape=(128, 128, 3),
+        include_top=False,
+        weights='imagenet'
+    )
+    base_model.trainable = False
+    return base_model
+
+# Create pre-trained model
+pre_trained_model = create_pre_trained_model()
+
+# Custom callback to detect overfitting
+class CustomCallback(tf.keras.callbacks.Callback):
+    def on_epoch_end(self, epoch, logs=None):
+        if logs.get('val_loss') > logs.get('loss') + 0.02:
+            print("Overfit detected, stopping training")
+            self.model.stop_training = True
+
+# Function to create the final model
+def create_final_model(base_model):
+    model = tf.keras.Sequential([
+        base_model,
+        tf.keras.layers.GlobalAveragePooling2D(),
+        tf.keras.layers.Dropout(0.3),
+        tf.keras.layers.Dense(512, activation='relu'),
+        tf.keras.layers.Dense(len(train_generator.class_indices), activation='softmax')
+    ])
+    
+    model.compile(
+        optimizer='adam',
+        loss='categorical_crossentropy',
+        metrics=['accuracy']
+    )
+    
+    return model
+
+# Create the final model
+with strategy.scope():
+    model = create_final_model(pre_trained_model)
+
+# Model summary
+model.summary()
+
+# Set up callbacks and train the model
+callbacks = CustomCallback()
+history = model.fit(
+    train_generator,
+    validation_data=validation_generator,
+    epochs=10,
+    callbacks=[callbacks]
+)
+
+# Plot training and validation metrics
+acc = history.history['accuracy']
+val_acc = history.history['val_accuracy']
+loss = history.history['loss']
+val_loss = history.history['val_loss']
+
+plt.figure(figsize=(8, 8))
+plt.subplot(2, 1, 1)
+plt.plot(acc, label='Training Accuracy')
+plt.plot(val_acc, label='Validation Accuracy')
+plt.legend(loc='lower right')
+plt.ylabel('Accuracy')
+plt.ylim([0, 1])
+plt.title('Training and Validation Accuracy')
+
+plt.subplot(2, 1, 2)
+plt.plot(loss, label='Training Loss')
+plt.plot(val_loss, label='Validation Loss')
+plt.legend(loc='upper right')
+plt.ylabel('Cross Entropy')
+plt.ylim([0, 1.0])
+plt.title('Training and Validation Loss')
+plt.xlabel('epoch')
+plt.show()
+
+# Save the trained model
+model.save("/kaggle/working/model_mobilenetv1.keras")
+
+# Load the model for inference
+model = tf.keras.models.load_model('/kaggle/working/model_mobilenetv1.keras')
+
+# Save class labels
+class_indices = train_generator.class_indices
+labels = '\n'.join(sorted(class_indices.keys()))
+
+with open('class_labels.txt', 'w') as file:
+    file.write(labels)
+
+# Function to load class names
+def load_class_names(filepath):
+    with open(filepath, 'r') as file:
+        class_names = file.read().splitlines()
+    return class_names
+
+# Load class names
+class_names = load_class_names('class_labels.txt')
+
+# Function to preprocess images
+def preprocess_image(img_path, target_size):
+    img = tf.keras.preprocessing.image.load_img(img_path, target_size=target_size)
+    img_array = tf.keras.preprocessing.image.img_to_array(img)
+    img_array = np.expand_dims(img_array, axis=0)
+    img_array /= 255.0
+    return img_array
+
+# Function to predict image class
+def predict_image(model, img_array):
+    predictions = model.predict(img_array)
+    return predictions
+
+# Predict the class of an image
+img_path = '/kaggle/input/basic-ingredients/Dataset/chicken/Image_120.jpg'
+img_array = preprocess_image(img_path, (128, 128))
+predictions = predict_image(model, img_array)
+predicted_class_index = np.argmax(predictions)
+predicted_class_name = class_names[predicted_class_index]
+confidence_score = np.max(predictions)
+
+print(f'Predicted class: {predicted_class_name}')
+print(f'Confidence score: {confidence_score}')
